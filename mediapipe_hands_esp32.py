@@ -1,14 +1,28 @@
+"""
+UPDRS Parte 3 - Analisis de movimientos por vision artificial
+Ejercicios: 3.4 Golpeteo de dedos, 3.5 Movimientos de manos, 3.6 Pronacion/Supinacion
+Fuente de video: ESP32-CAM via WiFi AP
+
+Layout: video 800x600 a la izquierda + panel info 280px a la derecha
+"""
+
 import cv2
 import numpy as np
 import requests
 import mediapipe as mp
 import time
+from collections import deque
 
-# -------- CONFIG ESP32 ----------
+# -------- CONFIGURACION ----------
 ESP32_IP = "192.168.4.1"
 FRAME_URL = f"http://{ESP32_IP}/frame"
 
-# -------- MEDIA PIPE ----------
+# Dimensiones fijas de visualizacion
+VIDEO_W, VIDEO_H = 800, 600
+PANEL_W = 280
+CANVAS_W = VIDEO_W + PANEL_W   # 1080 total
+
+# -------- MEDIAPIPE ----------
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     static_image_mode=False,
@@ -18,149 +32,284 @@ hands = mp_hands.Hands(
 )
 
 # -------- COLORES POR DEDO ----------
-RIGHT_HAND_COLORS = {
-    'THUMB': (0, 0, 255),
-    'INDEX': (0, 255, 255),
-    'MIDDLE': (0, 255, 0),
-    'RING': (255, 0, 0),
-    'PINKY': (255, 0, 255)
+RIGHT_COLORS = {
+    'THUMB':  (0,   0,   255),
+    'INDEX':  (0,   255, 255),
+    'MIDDLE': (0,   255, 0),
+    'RING':   (255, 0,   0),
+    'PINKY':  (255, 0,   255)
 }
-
-LEFT_HAND_COLORS = {
-    'THUMB': (0, 128, 255),
-    'INDEX': (128, 255, 255),
+LEFT_COLORS = {
+    'THUMB':  (0,   128, 255),
+    'INDEX':  (128, 255, 255),
     'MIDDLE': (128, 255, 128),
-    'RING': (255, 128, 128),
-    'PINKY': (255, 128, 255)
+    'RING':   (255, 128, 128),
+    'PINKY':  (255, 128, 255)
 }
-
 FINGER_LANDMARKS = {
-    'THUMB': [1, 2, 3, 4],
-    'INDEX': [5, 6, 7, 8],
+    'THUMB':  [1, 2, 3, 4],
+    'INDEX':  [5, 6, 7, 8],
     'MIDDLE': [9, 10, 11, 12],
-    'RING': [13, 14, 15, 16],
-    'PINKY': [17, 18, 19, 20]
+    'RING':   [13, 14, 15, 16],
+    'PINKY':  [17, 18, 19, 20]
 }
-
 FINGER_CONNECTIONS = {
-    'THUMB': [(1, 2), (2, 3), (3, 4)],
-    'INDEX': [(5, 6), (6, 7), (7, 8)],
-    'MIDDLE': [(9, 10), (10, 11), (11, 12)],
-    'RING': [(13, 14), (14, 15), (15, 16)],
-    'PINKY': [(17, 18), (18, 19), (19, 20)]
+    'THUMB':  [(1,2),(2,3),(3,4)],
+    'INDEX':  [(5,6),(6,7),(7,8)],
+    'MIDDLE': [(9,10),(10,11),(11,12)],
+    'RING':   [(13,14),(14,15),(15,16)],
+    'PINKY':  [(17,18),(18,19),(19,20)]
 }
+PALM_CONNECTIONS = [(0,1),(1,5),(5,9),(9,13),(13,17),(0,17)]
 
-PALM_CONNECTIONS = [(0, 1), (1, 5), (5, 9), (9, 13), (13, 17), (0, 17)]
 
-# -------- FUNCIONES ---------
+# -------- TRACKER UPDRS ----------
+class UPDRSTracker:
+    def __init__(self):
+        self.tap_count      = 0
+        self.last_tap       = False
+        self.tap_times      = deque(maxlen=30)
+        self.pron_count     = 0
+        self.last_pron      = ""
+        self.oc_count       = 0
+        self.last_oc        = ""
+
+    def update_tap(self, tapping):
+        if tapping and not self.last_tap:
+            self.tap_count += 1
+            self.tap_times.append(time.time())
+        self.last_tap = tapping
+
+    def tap_freq(self):
+        now = time.time()
+        recent = [t for t in self.tap_times if now - t <= 5.0]
+        if len(recent) < 2:
+            return 0.0
+        return (len(recent) - 1) / (recent[-1] - recent[0])
+
+    def update_pron(self, state):
+        if state != "Neutro" and state != self.last_pron and self.last_pron:
+            self.pron_count += 1
+        self.last_pron = state
+
+    def update_oc(self, state):
+        if state != self.last_oc and self.last_oc:
+            self.oc_count += 1
+        self.last_oc = state
+
+
+trackers = {}
+
+
+# -------- HELPERS ----------
 def get_frame(url):
     try:
         r = requests.get(url, timeout=3)
         if r.status_code == 200:
             return r.content
     except requests.RequestException:
-        return None
+        pass
+    return None
 
-def draw_colored_landmarks(image, hand_landmarks, hand_label):
-    h, w, _ = image.shape
-    colors = RIGHT_HAND_COLORS if hand_label == "Right" else LEFT_HAND_COLORS
 
-    # Dibuja palma
-    for start_idx, end_idx in PALM_CONNECTIONS:
-        start = hand_landmarks.landmark[start_idx]
-        end = hand_landmarks.landmark[end_idx]
-        cv2.line(image,
-                 (int(start.x*w), int(start.y*h)),
-                 (int(end.x*w), int(end.y*h)),
-                 (180,180,180), 2)
+def hand_scale(lms):
+    """Distancia muneca -> MCP dedo medio como referencia de tamano."""
+    w, m = lms.landmark[0], lms.landmark[9]
+    return np.hypot(w.x - m.x, w.y - m.y)
 
-    # Dibuja cada dedo
-    for finger_name, color in colors.items():
-        for start_idx, end_idx in FINGER_CONNECTIONS[finger_name]:
-            start = hand_landmarks.landmark[start_idx]
-            end = hand_landmarks.landmark[end_idx]
-            cv2.line(image,
-                     (int(start.x*w), int(start.y*h)),
-                     (int(end.x*w), int(end.y*h)),
-                     color, 2)
-        for lm_idx in FINGER_LANDMARKS[finger_name]:
-            lm = hand_landmarks.landmark[lm_idx]
-            cv2.circle(image, (int(lm.x*w), int(lm.y*h)), 5, color, -1)
 
-    # Muñeca
-    wrist = hand_landmarks.landmark[0]
-    cv2.circle(image, (int(wrist.x*w), int(wrist.y*h)), 7, (220,220,220), -1)
+# -------- DETECCION DE EJERCICIOS ----------
 
-# -------- GESTOS ---------
-def dist_points(p1, p2):
-    return np.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2)
+def detect_tapping(lms):
+    """
+    UPDRS 3.4: Golpeteo indice-pulgar.
+    Umbral normalizado por tamano de mano (robusto a distancia de camara).
+    """
+    thumb, index = lms.landmark[4], lms.landmark[8]
+    dist = np.hypot(thumb.x - index.x, thumb.y - index.y)
+    s = hand_scale(lms)
+    return (dist / s) < 0.40 if s > 0.01 else False
 
-def finger_tapping(hand_landmarks):
-    return dist_points(hand_landmarks.landmark[4], hand_landmarks.landmark[8]) < 0.05
 
-def hand_open_close(hand_landmarks):
-    d = hand_landmarks.landmark[12].y - hand_landmarks.landmark[0].y
-    return "abierta" if d > 0.1 else "cerrada"
+def detect_open_close(lms):
+    """
+    UPDRS 3.5: Mano abierta/cerrada.
+    Cuenta dedos extendidos comparando tip.y < PIP.y (4 dedos sin pulgar).
+    """
+    tips_pips = [(8, 6), (12, 10), (16, 14), (20, 18)]
+    ext = sum(1 for t, p in tips_pips if lms.landmark[t].y < lms.landmark[p].y)
+    if ext >= 3:
+        return "Abierta"
+    if ext <= 1:
+        return "Cerrada"
+    return "Parcial"
 
-def pronation_supination(hand_landmarks):
-    wrist = hand_landmarks.landmark[0]
-    index_tip = hand_landmarks.landmark[8]
-    v = np.array([index_tip.x - wrist.x, index_tip.y - wrist.y])
 
-    angle_rad = np.arctan2(-v[1], v[0])  # invertimos y porque y+ va hacia abajo en imagen
-    angle_deg = (np.degrees(angle_rad) + 360) % 360
+def detect_pronation(lms, hand_label):
+    """
+    UPDRS 3.6: Pronacion / Supinacion.
 
-    if 60 <= angle_deg <= 120:
-        return "supinación (palma arriba)"
-    elif 240 <= angle_deg <= 300:
-        return "pronación (palma abajo)"
+    Calcula el vector normal al plano de la palma usando producto vectorial 3D
+    de los vectores muneca->MCP_indice y muneca->MCP_menique.
+
+    El componente Z de la normal indica hacia donde apunta la palma:
+      - Right hand: normal.z < 0 -> Supinacion (palma hacia camara)
+                    normal.z > 0 -> Pronacion  (dorso hacia camara)
+      - Left hand:  signo invertido
+
+    Movimiento del paciente:
+      Extender el brazo al frente, rotar el antebrazo alternando rapidamente
+      entre palma arriba (supinacion) y palma abajo (pronacion).
+    """
+    wrist     = lms.landmark[0]
+    index_mcp = lms.landmark[5]
+    pinky_mcp = lms.landmark[17]
+
+    v1 = np.array([index_mcp.x - wrist.x, index_mcp.y - wrist.y, index_mcp.z - wrist.z])
+    v2 = np.array([pinky_mcp.x - wrist.x, pinky_mcp.y - wrist.y, pinky_mcp.z - wrist.z])
+    nz = np.cross(v1, v2)[2]
+
+    th = 0.006
+    if hand_label == "Right":
+        if nz < -th:
+            return "Supinacion"
+        if nz > th:
+            return "Pronacion"
     else:
-        return "posición neutra"
+        if nz > th:
+            return "Supinacion"
+        if nz < -th:
+            return "Pronacion"
+    return "Neutro"
 
-# -------- INFO MANO ---------
-def draw_hand_info(image, hand_landmarks, handedness_label):
-    h, w, _ = image.shape
-    xs = [lm.x for lm in hand_landmarks.landmark]
-    ys = [lm.y for lm in hand_landmarks.landmark]
-    min_x, max_x = int(min(xs)*w), int(max(xs)*w)
-    min_y, max_y = int(min(ys)*h), int(max(ys)*h)
 
-    margin = 5
-    box_top = max(min_y - 100, 0)
-    box_bottom = min(max_y + 100, h-1)
-    box_left = max(min_x - 10, 0)
-    box_right = min(max_x + 10, w-1)
+# -------- DIBUJO ----------
 
-    colors_bg = (50,50,50) if handedness_label == "Right" else (80,50,80)
-    overlay = image.copy()
-    cv2.rectangle(overlay, (box_left, box_top), (box_right, box_bottom), colors_bg, -1)
-    alpha = 0.5
-    cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
+def draw_landmarks(canvas, lms, hand_label):
+    """Dibuja los landmarks de la mano sobre el area de video del canvas."""
+    colors = RIGHT_COLORS if hand_label == "Right" else LEFT_COLORS
 
-    y_text = box_top + 25
-    cv2.putText(image, handedness_label, (box_left+5, y_text),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
-    y_text += 35
+    for s_i, e_i in PALM_CONNECTIONS:
+        s, e = lms.landmark[s_i], lms.landmark[e_i]
+        p1 = (int(s.x * VIDEO_W), int(s.y * VIDEO_H))
+        p2 = (int(e.x * VIDEO_W), int(e.y * VIDEO_H))
+        cv2.line(canvas, p1, p2, (180, 180, 180), 2)
 
-    if finger_tapping(hand_landmarks):
-        cv2.putText(image, "Golpeteo de dedos", (box_left+5, y_text),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
-        y_text += 35
+    for fname, color in colors.items():
+        for s_i, e_i in FINGER_CONNECTIONS[fname]:
+            s, e = lms.landmark[s_i], lms.landmark[e_i]
+            p1 = (int(s.x * VIDEO_W), int(s.y * VIDEO_H))
+            p2 = (int(e.x * VIDEO_W), int(e.y * VIDEO_H))
+            cv2.line(canvas, p1, p2, color, 2)
+        for li in FINGER_LANDMARKS[fname]:
+            lm = lms.landmark[li]
+            cv2.circle(canvas, (int(lm.x * VIDEO_W), int(lm.y * VIDEO_H)), 4, color, -1)
 
-    estado_mano = hand_open_close(hand_landmarks)
-    cv2.putText(image, f"Mano {estado_mano}", (box_left+5, y_text),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,165,0), 2)
-    y_text += 35
+    wr = lms.landmark[0]
+    cv2.circle(canvas, (int(wr.x * VIDEO_W), int(wr.y * VIDEO_H)), 6, (220, 220, 220), -1)
 
-    rotacion = pronation_supination(hand_landmarks)
-    cv2.putText(image, rotacion, (box_left+5, y_text),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,165,255), 2)
+    # Etiqueta pequena junto a la muneca
+    wx = int(wr.x * VIDEO_W) - 15
+    wy = int(wr.y * VIDEO_H) - 12
+    cv2.putText(canvas, hand_label, (max(wx, 2), max(wy, 15)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
-# -------- LOOP PRINCIPAL ---------
+
+def draw_panel(canvas):
+    """Dibuja el panel lateral derecho con toda la informacion UPDRS."""
+    x0 = VIDEO_W
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    # Fondo del panel
+    cv2.rectangle(canvas, (x0, 0), (CANVAS_W, VIDEO_H), (25, 25, 30), -1)
+    # Linea separadora
+    cv2.line(canvas, (x0, 0), (x0, VIDEO_H), (80, 80, 90), 2)
+
+    px = x0 + 15   # margen izquierdo del texto
+    y = 30
+
+    # --- Titulo ---
+    cv2.putText(canvas, "UPDRS - Parte 3", (px, y), font, 0.6, (255, 255, 120), 2, cv2.LINE_AA)
+    y += 22
+    cv2.putText(canvas, "Evaluacion Motora", (px, y), font, 0.38, (160, 160, 170), 1, cv2.LINE_AA)
+    y += 8
+    cv2.line(canvas, (px, y), (x0 + PANEL_W - 15, y), (55, 55, 65), 1)
+    y += 20
+
+    # --- Lista de ejercicios ---
+    exercises = [
+        ("3.4", "Golpeteo de dedos"),
+        ("3.5", "Movimientos de manos"),
+        ("3.6", "Pronacion / Supinacion"),
+    ]
+    for code, name in exercises:
+        cv2.putText(canvas, f"{code} {name}", (px, y), font, 0.35, (140, 140, 150), 1, cv2.LINE_AA)
+        y += 18
+
+    y += 4
+    cv2.line(canvas, (px, y), (x0 + PANEL_W - 15, y), (55, 55, 65), 1)
+    y += 20
+
+    # --- Info por mano ---
+    for hand_label in ["Right", "Left"]:
+        tk = trackers.get(hand_label)
+        if not tk:
+            continue
+
+        name = "Mano Derecha" if hand_label == "Right" else "Mano Izquierda"
+        hdr_color = (200, 200, 255) if hand_label == "Right" else (255, 200, 255)
+
+        cv2.putText(canvas, name, (px, y), font, 0.52, hdr_color, 1, cv2.LINE_AA)
+        y += 24
+
+        # 3.4 Golpeteo
+        tap_active = tk.last_tap
+        tap_col = (0, 255, 100) if tap_active else (120, 120, 120)
+        tap_txt = "SI" if tap_active else "NO"
+        cv2.putText(canvas, f"Golpeteo: {tap_txt}", (px + 8, y), font, 0.40, tap_col, 1, cv2.LINE_AA)
+        y += 18
+        cv2.putText(canvas, f"Taps: {tk.tap_count}  ({tk.tap_freq():.1f} Hz)", (px + 8, y),
+                    font, 0.35, (140, 140, 140), 1, cv2.LINE_AA)
+        y += 22
+
+        # 3.5 Abrir/Cerrar
+        oc = tk.last_oc or "---"
+        oc_cols = {"Cerrada": (0, 255, 160), "Abierta": (50, 120, 255), "Parcial": (255, 210, 0)}
+        cv2.putText(canvas, f"Mano: {oc}", (px + 8, y), font, 0.40,
+                    oc_cols.get(oc, (140, 140, 140)), 1, cv2.LINE_AA)
+        y += 18
+        cv2.putText(canvas, f"Cambios: {tk.oc_count}", (px + 8, y),
+                    font, 0.35, (140, 140, 140), 1, cv2.LINE_AA)
+        y += 22
+
+        # 3.6 Pronacion/Supinacion
+        pr = tk.last_pron or "---"
+        pr_cols = {"Supinacion": (0, 220, 255), "Pronacion": (255, 160, 0), "Neutro": (140, 140, 140)}
+        cv2.putText(canvas, f"Rotacion: {pr}", (px + 8, y), font, 0.40,
+                    pr_cols.get(pr, (140, 140, 140)), 1, cv2.LINE_AA)
+        y += 18
+        cv2.putText(canvas, f"Cambios: {tk.pron_count}", (px + 8, y),
+                    font, 0.35, (140, 140, 140), 1, cv2.LINE_AA)
+        y += 30
+
+    # --- Controles al fondo ---
+    y_bottom = VIDEO_H - 45
+    cv2.line(canvas, (px, y_bottom), (x0 + PANEL_W - 15, y_bottom), (55, 55, 65), 1)
+    y_bottom += 20
+    cv2.putText(canvas, "[R] Reset contadores", (px, y_bottom), font, 0.36, (140, 190, 140), 1, cv2.LINE_AA)
+    y_bottom += 18
+    cv2.putText(canvas, "[Q] Salir", (px, y_bottom), font, 0.36, (190, 140, 140), 1, cv2.LINE_AA)
+
+
+# -------- LOOP PRINCIPAL ----------
+print("Conectando a ESP32-CAM...")
+print(f"URL: {FRAME_URL}")
+print("Presiona Q para salir, R para reiniciar contadores")
+
 while True:
     frame_data = get_frame(FRAME_URL)
     if not frame_data:
-        print("❌ Error obteniendo frame")
+        print("Sin frame, reintentando...")
         time.sleep(0.2)
         continue
 
@@ -168,21 +317,44 @@ while True:
     if frame is None:
         continue
 
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = hands.process(rgb_frame)
+    # Procesar con MediaPipe a resolucion original
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = hands.process(rgb)
 
+    # Crear canvas: video (800x600) + panel lateral (280px)
+    video = cv2.resize(frame, (VIDEO_W, VIDEO_H))
+    canvas = np.zeros((VIDEO_H, CANVAS_W, 3), dtype=np.uint8)
+    canvas[:, :VIDEO_W] = video
+
+    # Dibujar landmarks y evaluar ejercicios
     if results.multi_hand_landmarks:
-        for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
+        for idx, hand_lm in enumerate(results.multi_hand_landmarks):
             label = results.multi_handedness[idx].classification[0].label
-            draw_colored_landmarks(frame, hand_landmarks, label)
-            draw_hand_info(frame, hand_landmarks, label)
+            if label not in trackers:
+                trackers[label] = UPDRSTracker()
+            tk = trackers[label]
 
-    # Mostrar sin escalar para mantener resolución original
-    cv2.imshow("MediaPipe Hands ESP32", frame)
+            # Evaluar
+            tk.update_tap(detect_tapping(hand_lm))
+            tk.update_oc(detect_open_close(hand_lm))
+            tk.update_pron(detect_pronation(hand_lm, label))
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+            # Dibujar landmarks sobre el area de video
+            draw_landmarks(canvas, hand_lm, label)
+
+    # Dibujar panel lateral con info
+    draw_panel(canvas)
+
+    cv2.imshow("UPDRS Vision Artificial - ESP32", canvas)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
         break
+    elif key == ord('r'):
+        trackers.clear()
+        print("Contadores reiniciados")
 
-    time.sleep(0.03)
+    time.sleep(0.02)
 
 cv2.destroyAllWindows()
+hands.close()
