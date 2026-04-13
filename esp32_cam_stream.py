@@ -11,7 +11,7 @@ ap_if = network.WLAN(network.AP_IF)
 ap_if.active(True)
 
 ap_if.config(
-    essid="ESP32-S312",
+    essid="ESP32-S543",
     password="12345678",
     authmode=network.AUTH_WPA2_PSK,
     max_clients=4,
